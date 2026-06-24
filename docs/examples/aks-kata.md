@@ -355,6 +355,102 @@ Even if someone bypasses the gateway and reaches the pod directly:
 - **egress sidecar** (port 18080) requires the `OPENSANDBOX-EGRESS-AUTH` header
 - Only the user's HTTP server (port 8080) has no built-in auth — that's what secureAccess protects
 
+## Running an agent directly inside the sandbox
+
+The most common way to run an agent (like GitHub Copilot CLI) in a sandbox is to `kubectl exec` into the pod and run it interactively. However, the Credential Vault's MITM proxy requires the sandbox process to trust the sidecar's CA certificate. This section explains how to make that work.
+
+### Why `kubectl exec` doesn't work out of the box
+
+When you `kubectl exec` into the sandbox container, outbound HTTPS traffic **is** intercepted by the egress sidecar (via iptables REDIRECT in the shared pod network namespace). However, the MITM proxy terminates and re-encrypts TLS using its own CA certificate. The sandbox container's trust store doesn't include this CA by default, so TLS handshakes fail:
+
+```bash
+kubectl exec -it -n opensandbox <pod-name> -c sandbox -- bash
+
+# This fails with "SSL certificate problem: unable to get local issuer certificate"
+curl -s https://api.github.com/octocat
+```
+
+When you use the SDK's `commands.run()` instead, it works because the **execd daemon** sources `components/execd/bootstrap.sh` at startup, which:
+
+1. Reads the MITM CA from `/opt/opensandbox/mitmproxy-ca-cert.pem` (on the shared `opensandbox-bin` volume)
+2. Builds a merged CA bundle at `/opt/opensandbox/merged-ca-certificates.pem` (system root CAs + MITM CA)
+3. Exports `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, and `REQUESTS_CA_BUNDLE` pointing to the merged bundle
+4. Runs your command with those env vars inherited
+
+### Setting up trust manually after `kubectl exec`
+
+After `kubectl exec` into the sandbox, set the same env vars that execd would:
+
+```bash
+kubectl exec -it -n opensandbox <pod-name> -c sandbox -- bash
+
+# Set trust for all common TLS libraries
+export SSL_CERT_FILE=/opt/opensandbox/merged-ca-certificates.pem
+export NODE_EXTRA_CA_CERTS=/opt/opensandbox/mitmproxy-ca-cert.pem
+export REQUESTS_CA_BUNDLE=/opt/opensandbox/merged-ca-certificates.pem
+export CURL_CA_BUNDLE=/opt/opensandbox/merged-ca-certificates.pem
+```
+
+Now outbound HTTPS works and Credential Vault injects tokens transparently:
+
+```bash
+# Verify TLS works through the sidecar
+curl -s https://api.github.com/octocat
+
+# Verify Credential Vault token injection (fake token gets replaced with real one)
+curl -s -H "Authorization: Bearer $COPILOT_GITHUB_TOKEN" https://api.github.com/user
+# Returns your GitHub user info even though $COPILOT_GITHUB_TOKEN is fake
+
+# Run GitHub Copilot CLI
+copilot --no-auto-update --disable-builtin-mcps \
+  -p "Explain what kubectl apply does" \
+  -s --no-ask-user --allow-all --deny-tool=shell --deny-tool=write
+```
+
+### How to verify the egress sidecar is intercepting traffic
+
+From a **separate terminal**, watch the egress sidecar logs while running commands inside the sandbox:
+
+```bash
+kubectl logs -n opensandbox <pod-name> -c egress -f
+```
+
+You'll see entries like:
+
+```
+credential proxy: injected binding=copilot-github-bearer host=api.github.com headers=Authorization
+10.244.4.161:40258: GET https://140.82.112.21/models << 200 OK
+10.244.4.161:40258: POST https://140.82.112.21/v1/messages << 200 OK
+```
+
+This confirms:
+- The sidecar intercepted outbound HTTPS traffic
+- Credential Vault injected the real `Authorization: Bearer` header
+- The upstream API accepted the request
+
+### Key file locations (shared `opensandbox-bin` volume)
+
+| Path | Description |
+|------|-------------|
+| `/opt/opensandbox/mitmproxy-ca-cert.pem` | The MITM proxy's CA certificate (add to trust stores) |
+| `/opt/opensandbox/merged-ca-certificates.pem` | Complete bundle: system root CAs + MITM CA |
+| `/opt/opensandbox/bootstrap.sh` | The execd startup script that sets up CA trust (source: `components/execd/bootstrap.sh`) |
+| `/opt/opensandbox/execd` | The execd daemon binary |
+
+### One-liner for interactive agent sessions
+
+Combine everything into a single command:
+
+```bash
+kubectl exec -it -n opensandbox <pod-name> -c sandbox -- bash -c '
+  export SSL_CERT_FILE=/opt/opensandbox/merged-ca-certificates.pem
+  export NODE_EXTRA_CA_CERTS=/opt/opensandbox/mitmproxy-ca-cert.pem
+  export REQUESTS_CA_BUNDLE=/opt/opensandbox/merged-ca-certificates.pem
+  exec bash'
+```
+
+This drops you into a shell where all outbound HTTPS works with Credential Vault injection.
+
 ## Cleanup
 
 Remove everything installed by this example:
